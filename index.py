@@ -4,6 +4,7 @@ import json
 import time
 import logging
 import uuid
+import hashlib
 from typing import Dict, List, Optional, Set
 import colorama
 from colorama import Fore, Back, Style
@@ -15,6 +16,7 @@ import threading
 import io
 import wbi
 import bili_ticket
+import buvid_spi  # 2026-06-03: B 站升级 web_im 风控, 必须带 buvid3/buvid4/b_nut cookie
 from plugin_loader import plugin_loader
 
 if hasattr(sys.stdout, 'reconfigure'):
@@ -32,6 +34,14 @@ else:
 config = ConfigManage.ConfigManager("config.json")
 
 version = "1.1.1"
+STATE_FILE = "reply_state.json"
+ACTIVITY_FILE = "message_activity.json"
+MAX_PROCESSED_IDS = 2000
+MAX_ACTIVITY_EVENTS = 200
+activity_lock = threading.Lock()
+STALE_MESSAGE_SECONDS = int(os.environ.get("BILIBOT_STALE_MESSAGE_SECONDS", "300"))
+BOT_POLL_INTERVAL_SECONDS = float(os.environ.get("BILIBOT_POLL_INTERVAL_SECONDS", "10"))
+MESSAGE_SCAN_INTERVAL_SECONDS = float(os.environ.get("BILIBOT_MESSAGE_SCAN_INTERVAL_SECONDS", "0"))
 
 # 初始化colorama
 colorama.init(autoreset=True)
@@ -41,6 +51,59 @@ def clean_screen():
         os.system("cls")
     else:
         os.system("clear")
+
+def make_state_key(account_name: str, self_uid: int) -> str:
+    raw_key = f"{account_name}:{self_uid}"
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:16]
+
+def load_reply_state() -> Dict[str, List[str]]:
+    if not os.path.exists(STATE_FILE):
+        return {}
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def save_reply_state(state: Dict[str, List[str]]):
+    tmp_file = f"{STATE_FILE}.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_file, STATE_FILE)
+
+def append_message_activity(event: Dict):
+    event = {
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        **event,
+    }
+    with activity_lock:
+        try:
+            if os.path.exists(ACTIVITY_FILE):
+                with open(ACTIVITY_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            else:
+                data = {}
+            events = data.get("events", [])
+            if not isinstance(events, list):
+                events = []
+            summary = data.get("summary")
+            if not isinstance(summary, dict):
+                summary = {
+                    "replied": sum(1 for item in events if isinstance(item, dict) and item.get("status") == "replied")
+                }
+            summary["replied"] = int(summary.get("replied", 0))
+            if event.get("status") == "replied":
+                summary["replied"] += 1
+            events.append(event)
+            events = events[-MAX_ACTIVITY_EVENTS:]
+            payload = {"last_event": event, "events": events, "summary": summary}
+            tmp_file = f"{ACTIVITY_FILE}.tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            os.replace(tmp_file, ACTIVITY_FILE)
+        except OSError as e:
+            print(f"{Fore.RED}✗ 写入消息处理状态失败: {Fore.MAGENTA}{e}")
 
 class BotManager:
     def __init__(self):
@@ -61,7 +124,6 @@ class BotManager:
             return False
             
         self.running = True
-        plugin_loader.load_all_plugins()
         accounts = config.get_accounts()
         
         for i, account in enumerate(accounts):
@@ -77,8 +139,9 @@ class BotManager:
                     auto_focus=account.get("auto_focus", False),
                     auto_reply_follow=account.get("auto_reply_follow", False),
                     follow_reply_message=account.get("follow_reply_message", "感谢关注！"),
-                    no_focus_hf=account.get("no_focus_hf", False),
-                    poll_interval=5,
+                    no_focus_hf=account.get("no_focus_hf", True),
+                    keyword_match_mode=account.get("keyword_match_mode", "contains"),
+                    poll_interval=BOT_POLL_INTERVAL_SECONDS,
                 )
                 self.bots.append(bot)
                 
@@ -98,17 +161,20 @@ class BotManager:
                 # 重新设置依赖，传入真实的 bots
                 self.plugin_loader.set_dependencies(self, config)
                 
-                # 加载所有插件
-                success = self.plugin_loader.load_all_plugins()
-                if success:
+                plugin_names = self.plugin_loader.discover_plugins()
+                if not plugin_names:
+                    print(f"{Fore.YELLOW}未发现插件，跳过插件加载")
+                else:
+                    success = self.plugin_loader.load_all_plugins()
                     loaded_plugins = [p for p in self.plugin_loader.get_all_plugins() if p.instance]
-                    print(f"{Fore.GREEN}✓ 已加载 {len(loaded_plugins)} 个插件")
+                    if success:
+                        print(f"{Fore.GREEN}✓ 已加载 {len(loaded_plugins)} 个插件")
+                    else:
+                        print(f"{Fore.YELLOW}⚠ 插件加载不完整，已加载 {len(loaded_plugins)}/{len(plugin_names)} 个插件")
                     
                     # 打印已加载的插件信息
                     for plugin in loaded_plugins:
                         print(f"{Fore.CYAN}  - {plugin.name} (v{plugin.metadata.get('version', '1.0.0')})")
-                else:
-                    print(f"{Fore.YELLOW}⚠ 插件加载过程中出现问题")
             except Exception as e:
                 print(f"{Fore.RED}✗ 插件加载失败: {e}")
         return True
@@ -125,7 +191,7 @@ class BotManager:
                 plugin.unload()
 
 class SimpleBilibiliReply:
-    def __init__(self, account_name, sessdata, bili_jct, self_uid, device_id, keywords, at_user, auto_focus, poll_interval=5, auto_reply_follow=False, follow_reply_message="感谢关注！", no_focus_hf = False):
+    def __init__(self, account_name, sessdata, bili_jct, self_uid, device_id, keywords, at_user, auto_focus, poll_interval=5, auto_reply_follow=False, follow_reply_message="感谢关注！", no_focus_hf=True, keyword_match_mode="contains"):
         self.account_name = account_name
         self.sessdata = sessdata
         self.bili_jct = bili_jct
@@ -133,20 +199,36 @@ class SimpleBilibiliReply:
         self.poll_interval = poll_interval
         self.running = False
         self.no_focus_hf = no_focus_hf
+        self.keyword_match_mode = keyword_match_mode if keyword_match_mode in {"contains", "exact"} else "contains"
         
         # 生成设备ID
         self.device_id = device_id
 
         self.plugin_loader = None
         
+        # 2026-06-03 owner 修 412: B 站升级 web_im/send_msg 风控, 必须带 buvid3/buvid4/b_nut
+        # SPI 公开接口, 匿名拉 (启动一次, 模块级缓存). 实测无 buvid 返 412+HTML 风控页; 加上后 200.
+        buvids = buvid_spi.get()
+        cookie_parts = [
+            f"SESSDATA={sessdata}",
+            f"bili_jct={bili_jct}",
+            f"bili_ticket={bili_ticket.get()}",
+            f"DedeUserID={self_uid}",  # web 端登录态标识
+        ]
+        if buvids.get("buvid3"):
+            cookie_parts.append(f"buvid3={buvids['buvid3']}")
+        if buvids.get("buvid4"):
+            cookie_parts.append(f"buvid4={buvids['buvid4']}")
+        if buvids.get("b_nut"):
+            cookie_parts.append(f"b_nut={buvids['b_nut']}")
         self.headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             "Accept": "*/*",
             "Accept-Language": "zh-CN,zh;q=0.9",
             "Content-Type": "application/x-www-form-urlencoded",
             "Origin": "https://message.bilibili.com",
             "Referer": "https://message.bilibili.com/",
-            "Cookie": f"SESSDATA={sessdata}; bili_jct={bili_jct}; bili_ticket={bili_ticket.get()}"
+            "Cookie": "; ".join(cookie_parts),
         }
         
         # 设置自动回复关键词（账号特定 + 全局）
@@ -162,7 +244,10 @@ class SimpleBilibiliReply:
         
         self.processed_follow_ids = set()
         
-        self.processed_msg_ids = set()
+        self.state_key = make_state_key(self.account_name, self.self_uid)
+        self.reply_state = load_reply_state()
+        self.processed_msg_ids = set(self.reply_state.get(self.state_key, []))
+        self.unmatched_msg_ids = set()
         print(f"{Fore.GREEN}✓ {Fore.BLUE}[{self.account_name}] 哔哩哔哩私信自动回复机器人启动成功")
     
     def stop(self):
@@ -190,12 +275,15 @@ class SimpleBilibiliReply:
                 if data.get("code") == 0:
                     return data.get("data", {}).get("session_list", [])
                 else:
-                    print(f"{Fore.RED}✗ [{self.account_name}] API错误: {data.get('message')}")
+                    print(f"{Fore.RED}✗ [{self.account_name}] get_sessions API错误: code={data.get('code')} msg={data.get('message')}")
+            else:
+                # 2026-06-03 修: 拉 sessions 失败也得说话, 不然 412 静默
+                print(f"{Fore.RED}✗ [{self.account_name}] get_sessions HTTP错误: {response.status_code} | body: {(response.text or '')[:300]!r}")
         except Exception as e:
             print(f"{Fore.RED}✗ [{self.account_name}] 获取会话列表异常: {e}")
-        
+
         return []
-    
+
     def get_focus(self) -> Optional[Dict]:
         api = "https://api.bilibili.com/x/relation/fans"
         params = {
@@ -374,23 +462,45 @@ class SimpleBilibiliReply:
             return None
 
     def check_keywords(self, message: str) -> Optional[str]:
-        """检查消息是否包含关键词"""
+        """检查消息是否命中关键词"""
+        match = self.find_keyword_match(message)
+        return match[1] if match else None
+
+    def find_keyword_match(self, message: str) -> Optional[tuple]:
+        """返回命中的关键词和回复内容"""
         if not message:
             return None
             
-        lower_message = message.lower()
+        normalized_message = message.strip().lower()
         
         for keyword, reply in self.keyword_reply.items():
-            if ';' in keyword:
-                keywords = [k.strip() for k in keyword.split(";") if k.strip()]
-                for k in keywords:
-                    if k.lower() in lower_message:
-                        return reply
-            else:
-                if keyword.lower() in lower_message:
-                    return reply
+            keywords = [k.strip().lower() for k in keyword.split(";") if k.strip()]
+            for k in keywords:
+                if self.keyword_match_mode == "exact" and k == normalized_message:
+                    return keyword, reply
+                if self.keyword_match_mode == "contains" and k in normalized_message:
+                    return keyword, reply
         
         return None
+
+    def mark_message_processed(self, msg_id):
+        msg_id = str(msg_id)
+        self.processed_msg_ids.add(msg_id)
+        msg_ids = self.reply_state.get(self.state_key, [])
+        if msg_id not in msg_ids:
+            msg_ids.append(msg_id)
+        msg_ids = msg_ids[-MAX_PROCESSED_IDS:]
+        self.processed_msg_ids = set(msg_ids)
+        self.reply_state[self.state_key] = msg_ids
+        try:
+            save_reply_state(self.reply_state)
+        except OSError as e:
+            print(f"{Fore.RED}✗ [{self.account_name}] 保存回复状态失败: {Fore.MAGENTA}{e}")
+
+    def can_reply_to_user(self, talker_id: int) -> bool:
+        if self.no_focus_hf:
+            return True
+        return self.is_following_me(talker_id)
 
     def send_message(self, receiver_id: int, message: str) -> bool:
         """发送消息"""
@@ -457,8 +567,14 @@ class SimpleBilibiliReply:
                     if data.get("code") in [-400, 1000]:
                         return True
             else:
-                print(f"{Fore.RED}✗ [{self.account_name}] HTTP错误: {Fore.MAGENTA}{response.status_code}")
-                
+                # 2026-06-03 修: 412 等错误必须把 B 站 response body 印出来才能 RCA
+                body_preview = (response.text or "")[:500]
+                print(f"{Fore.RED}✗ [{self.account_name}] HTTP错误: {Fore.MAGENTA}{response.status_code} | body: {body_preview!r}")
+                # response.headers 里也可能有 B 站风控提示 (如 set-cookie 替换)
+                hkeys = [k for k in response.headers.keys() if k.lower() in ("set-cookie", "x-bili-trace-id", "bili-status-code")]
+                if hkeys:
+                    print(f"{Fore.RED}  ↑ headers: {[(k, response.headers.get(k)[:120]) for k in hkeys]}")
+
         except Exception as e:
             print(f"{Fore.RED}✗ [{self.account_name}] 发送消息异常: {Fore.MAGENTA}{e}")
         
@@ -545,26 +661,38 @@ class SimpleBilibiliReply:
             sessions = self.get_sessions()
             if not sessions:
                 return
+
+            sessions = sorted(
+                sessions,
+                key=lambda item: int((item.get("last_msg") or {}).get("timestamp") or 0),
+                reverse=True,
+            )
             
-            for session in sessions:
+            for session_index, session in enumerate(sessions):
                 try:
                     talker_id = session.get("talker_id")
-                    last_msg = session.get("last_msg", {})
+                    last_msg = session.get("last_msg") or {}
+                    if not last_msg:
+                        continue
                     
                     msg_id = last_msg.get("msg_seqno")
                     sender_uid = last_msg.get("sender_uid")
                     timestamp = last_msg.get("timestamp", 0)
                     receiver_id = last_msg.get("receiver_id")
+                    unread_count = int(session.get("unread_count") or session.get("unread") or 0)
                     
                     if sender_uid == int(self.self_uid): # 判断是否是自己的消息
                         continue
                     
-                    if not msg_id or msg_id in self.processed_msg_ids: # 判断是否已回复
+                    msg_id_key = str(msg_id)
+                    if not msg_id or msg_id_key in self.processed_msg_ids: # 判断是否已回复
                         continue
                     
                     current_time = int(time.time())
-                    if current_time - timestamp > 300:
+                    if current_time - timestamp > STALE_MESSAGE_SECONDS and unread_count <= 0:
                         continue
+                    if current_time - timestamp > STALE_MESSAGE_SECONDS and unread_count > 0:
+                        print(f"{Fore.YELLOW}⚠ [{self.account_name}] 检测到掉线期间未回复私信，未读数: {Fore.MAGENTA}{unread_count}")
                     
                     message_text = self.extract_message_content(last_msg)
                     if not message_text:
@@ -573,6 +701,7 @@ class SimpleBilibiliReply:
                     print(f"{Fore.GREEN}✓ [{self.account_name}] 收到来自 {Fore.MAGENTA}{talker_id} {Fore.GREEN}的消息: {Fore.MAGENTA}{message_text}")
 
                     plugin_reply = None
+                    matched_keyword = ""
                     if self.plugin_loader:
                         plugin_reply = self.process_message_with_plugins(message_text, {
                             'talker_id': talker_id,
@@ -584,36 +713,91 @@ class SimpleBilibiliReply:
                     
                     if plugin_reply:
                         reply = plugin_reply
+                        matched_keyword = "插件回复"
                         print(f"{Fore.CYAN}  [{self.account_name}] 插件返回回复: {Fore.MAGENTA}{reply}")
                     else:
                         # 否则使用原有的关键词匹配
-                        reply = self.check_keywords(message_text)
+                        keyword_match = self.find_keyword_match(message_text)
+                        if keyword_match:
+                            matched_keyword, reply = keyword_match
+                            print(f"{Fore.GREEN}✓ [{self.account_name}] 命中关键词: {Fore.MAGENTA}{matched_keyword}")
+                        else:
+                            reply = None
 
                     if reply:
-                        if self.is_following_me(talker_id):
+                        if self.can_reply_to_user(talker_id):
                             success = self.send_message(talker_id, reply)
                             
                             if self.auto_focus:
-                                focus = self.Auto_focus(receiver_id)
+                                focus = self.Auto_focus(talker_id)
                                 if focus == True:
                                     print(f"{Fore.GREEN}✓ [{self.account_name}] 关注成功")
                                 else:
                                     print(f"{Fore.RED}✗ [{self.account_name}] 关注失败，可能已关注对方")
                             
                             if success:
-                                self.processed_msg_ids.add(msg_id)
+                                self.mark_message_processed(msg_id)
+                                append_message_activity({
+                                    "account": self.account_name,
+                                    "status": "replied",
+                                    "talker_id": talker_id,
+                                    "msg_id": msg_id,
+                                    "message": message_text,
+                                    "matched_keyword": matched_keyword,
+                                    "reply": reply,
+                                    "detail": "回复成功"
+                                })
                                 print(f"{Fore.GREEN}✓ [{self.account_name}] 已处理消息 {Fore.MAGENTA}{msg_id}")
                             else:
-                                print(f"{Fore.RED}✗ [{self.account_name}] 发送消息失败")
+                                append_message_activity({
+                                    "account": self.account_name,
+                                    "status": "reply_failed",
+                                    "talker_id": talker_id,
+                                    "msg_id": msg_id,
+                                    "message": message_text,
+                                    "matched_keyword": matched_keyword,
+                                    "reply": reply,
+                                    "detail": "发送消息失败"
+                                })
+                                # 2026-06-03 owner 修死循环: 发失败也 mark_processed 防 5s 一轮死磕同一条
+                                # 不然 412 → 不记 → 5s 后再拉到同一条 → 再 412 → 触发更深 B 站风控
+                                # 失败可以靠面板看流水手动处理, 但不能让 bot 自己撞墙
+                                self.mark_message_processed(msg_id)
+                                print(f"{Fore.RED}✗ [{self.account_name}] 发送消息失败 (已标记防重试)")
                         else:
                             print(f"{Fore.RED}✗ [{self.account_name}] 用户 {talker_id} 未关注您，不发送回复")
-                            self.processed_msg_ids.add(msg_id)
-                            self.send_message(talker_id, "你还没有点点关注哦~，白嫖可耻！")
+                            append_message_activity({
+                                "account": self.account_name,
+                                "status": "blocked",
+                                "talker_id": talker_id,
+                                "msg_id": msg_id,
+                                "message": message_text,
+                                "matched_keyword": matched_keyword,
+                                "reply": reply,
+                                "detail": "用户未关注，未发送回复"
+                            })
+                            self.mark_message_processed(msg_id)
+                    elif msg_id_key not in self.unmatched_msg_ids:
+                        self.unmatched_msg_ids.add(msg_id_key)
+                        append_message_activity({
+                            "account": self.account_name,
+                            "status": "unmatched",
+                            "talker_id": talker_id,
+                            "msg_id": msg_id,
+                            "message": message_text,
+                            "matched_keyword": "",
+                            "reply": "",
+                            "detail": "未命中关键词，未回复"
+                        })
+                        print(f"{Fore.YELLOW}⚠ [{self.account_name}] 未命中关键词，不回复: {Fore.MAGENTA}{message_text}")
                             
                     
                 except Exception as e:
                     print(f"{Fore.RED}✗ [{self.account_name}] 处理会话异常: {Fore.MAGENTA}{e}")
                     continue
+                finally:
+                    if session_index < len(sessions) - 1 and MESSAGE_SCAN_INTERVAL_SECONDS > 0:
+                        time.sleep(MESSAGE_SCAN_INTERVAL_SECONDS)
                     
         except Exception as e:
             print(f"{Fore.RED}✗ [{self.account_name}] 处理消息主循环异常: {Fore.MAGENTA}{e}")
