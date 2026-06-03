@@ -33,7 +33,7 @@ else:
 
 config = ConfigManage.ConfigManager("config.json")
 
-version = "1.1.1"
+version = "1.0.0"  # Vbot v1.0.0 (fork from 7Hello80/BPMB v1.1.1, 2026-06-03 修 412 风控)
 STATE_FILE = "reply_state.json"
 ACTIVITY_FILE = "message_activity.json"
 MAX_PROCESSED_IDS = 2000
@@ -249,7 +249,7 @@ class SimpleBilibiliReply:
         self.reply_state = load_reply_state()
         self.processed_msg_ids = set(self.reply_state.get(self.state_key, []))
         self.unmatched_msg_ids = set()
-        print(f"{Fore.GREEN}✓ {Fore.BLUE}[{self.account_name}] 哔哩哔哩私信自动回复机器人启动成功")
+        print(f"{Fore.GREEN}✓ {Fore.BLUE}[{self.account_name}] Vbot — B 站私信自动回复机器人启动成功")
     
     def stop(self):
         """停止机器人"""
@@ -892,11 +892,11 @@ def inspect_config():
     print(f"{Fore.GREEN}✓ 检查完成，开始运行\n")
     time.sleep(0.5)
     clean_screen()
-    print(f"{Fore.GREEN}程序名称: {Fore.WHITE}哔哩哔哩私信机器人")
+    print(f"{Fore.GREEN}程序名称: {Fore.WHITE}Vbot — B 站私信自动回复机器人")
     print(f"{Fore.GREEN}版本号: {Fore.WHITE}v{version}")
-    print(f"{Fore.GREEN}作者: {Fore.WHITE}淡意往事")
-    print(f"{Fore.GREEN}哔哩哔哩主页: {Fore.WHITE}https://b23.tv/tq8hoKu")
-    print(f"{Fore.GREEN}Github: {Fore.WHITE}https://github.com/7hello80")
+    print(f"{Fore.GREEN}作者: {Fore.WHITE}heishiqing")
+    print(f"{Fore.GREEN}Github: {Fore.WHITE}https://github.com/heishiqing/Vbot")
+    print(f"{Fore.GREEN}基于: {Fore.WHITE}@7Hello80/Bilibili_PrivateMessage_Bot v1.1.1 (MIT)")
     print(f"{Fore.GREEN}启动时间: {Fore.WHITE}{time.strftime('%Y-%m-%d %H:%M:%S')}")
     return True
 

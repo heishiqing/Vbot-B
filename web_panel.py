@@ -5,9 +5,11 @@ import secrets
 import string
 import threading
 import time
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 from urllib.parse import urlencode
-from flask import Flask, render_template, request, jsonify, session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for, Response
 from werkzeug.security import generate_password_hash, check_password_hash
 import subprocess
 import psutil
@@ -33,7 +35,7 @@ from github import Github
 # 导入现有的配置管理
 import ConfigManage
 
-CURRENT_VERSION = "MS4xLjE="
+CURRENT_VERSION = "MS4wLjA="  # base64("1.0.0")
 UPDATE_CHECK_URL = "aHR0cDovLzExNC4xMzQuMTg4LjE4OD9pZD0x"
 Version = "2.0.4"
 system_name = platform.system()
@@ -54,6 +56,12 @@ app.secret_key = 'bilibili_bot_panel_secret_key_2024'
 # 面板配置
 PANEL_CONFIG_FILE = "panel_config.json"
 LOG_FILE = "bot_runtime.log"
+ACTIVITY_FILE = "message_activity.json"
+PASSWORD_HASH_METHOD = "pbkdf2:sha256"
+LOGIN_QR_DIR = os.path.join("runtime", "login_qr")
+
+def hash_password(password):
+    return generate_password_hash(password, method=PASSWORD_HASH_METHOD)
 
 class PanelConfigManager:
     def __init__(self, config_path: str):
@@ -65,7 +73,7 @@ class PanelConfigManager:
         default_config = {
             "admin": {
                 "username": "admin",
-                "password": generate_password_hash("admin123")
+                "password": hash_password("admin123")
             },
             "bot_settings": {
                 "poll_interval": 5
@@ -74,8 +82,8 @@ class PanelConfigManager:
                 "client_id": "",
                 "client_secret": "",
                 "access_token": "",
-                "repo_owner": "7Hello80",
-                "repo_name": "Bilibili_PrivateMessage_Bot"
+                "repo_owner": "heishiqing",
+                "repo_name": "Vbot"
             }
         }
         
@@ -98,6 +106,12 @@ class PanelConfigManager:
     
     def check_for_updates(self):
         """检查更新"""
+        if os.environ.get("BILIBOT_ENABLE_REMOTE_CONTENT") != "1":
+            return {
+                'has_update': False,
+                'update_info': None,
+                'current_version': ConfigManage.base64_decode(CURRENT_VERSION)
+            }
         try:
             response = requests.get(ConfigManage.base64_decode(UPDATE_CHECK_URL), timeout=10)
             if response.status_code == 200:
@@ -131,7 +145,7 @@ class PanelConfigManager:
         
         self.config["admin"]["username"] = username
         if password:  # 只有当密码不为空时才更新密码
-            self.config["admin"]["password"] = generate_password_hash(password)
+            self.config["admin"]["password"] = hash_password(password)
         self.save_config()
     
     def get_github_config(self):
@@ -192,8 +206,8 @@ class GitHubDiscussionManager:
                     # 如果新方式不可用，回退到旧方式
                     self.github_client = Github(access_token)
                     logging.warning("使用旧的GitHub认证方式，建议升级PyGithub库")
-                repo_owner = github_config.get("repo_owner", "7Hello80")
-                repo_name = github_config.get("repo_name", "Bilibili_PrivateMessage_Bot")
+                repo_owner = github_config.get("repo_owner", "heishiqing")
+                repo_name = github_config.get("repo_name", "Vbot")
                 self.repo = self.github_client.get_repo(f"{repo_owner}/{repo_name}")
             except Exception as e:
                 logging.error(f"初始化GitHub客户端失败: {str(e)}")
@@ -394,6 +408,427 @@ github_manager = GitHubDiscussionManager(panel_config)
 # 初始化配置管理器
 bot_config = ConfigManage.ConfigManager("config.json")
 
+MASKED_SECRET = "********"
+
+def mask_secret(value):
+    """返回可展示但不可还原的敏感字段。"""
+    if not value:
+        return ""
+    value = str(value)
+    if len(value) <= 8:
+        return MASKED_SECRET
+    return f"{value[:4]}{MASKED_SECRET}{value[-4:]}"
+
+def is_masked_secret(value):
+    return not value or MASKED_SECRET in str(value)
+
+def public_account(account):
+    safe_account = json.loads(json.dumps(account, ensure_ascii=False))
+    account_config = safe_account.get("config", {})
+    account_config["sessdata"] = mask_secret(account_config.get("sessdata", ""))
+    account_config["bili_jct"] = mask_secret(account_config.get("bili_jct", ""))
+    return safe_account
+
+def public_accounts(accounts):
+    return [public_account(account) for account in accounts]
+
+ACCOUNT_HEALTH_TTL = 30
+ACCOUNT_HEALTH_MONITOR_INTERVAL = int(os.environ.get("BILIBOT_ACCOUNT_HEALTH_INTERVAL", "300"))
+account_health_cache = {
+    "timestamp": 0,
+    "result": None
+}
+account_health_last_status = {}
+notification_last_sent = {}
+login_recovery_sessions = {}
+manual_relogin_sessions = {}
+
+DEFAULT_HERMES_WEBHOOK_URL = "http://127.0.0.1:8644/webhooks/bilibot_login"
+NOTIFICATION_COOLDOWN_SECONDS = int(os.environ.get("BILIBOT_NOTIFY_COOLDOWN", "900"))
+
+def is_truthy_env(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+def get_panel_url():
+    return os.environ.get("BILIBOT_PUBLIC_PANEL_URL", "http://127.0.0.1:5000").rstrip("/")
+
+def get_notification_webhook_url():
+    return (
+        os.environ.get("BILIBOT_HERMES_WEBHOOK_URL")
+        or os.environ.get("BILIBOT_NOTIFY_WEBHOOK_URL")
+        or DEFAULT_HERMES_WEBHOOK_URL
+    )
+
+def notifications_enabled():
+    if "BILIBOT_NOTIFY_ENABLED" in os.environ:
+        return is_truthy_env("BILIBOT_NOTIFY_ENABLED")
+    return bool(get_notification_webhook_url())
+
+def send_status_notification(event_key, title, lines, media_path=None):
+    """发送账号状态通知；默认走本机 Hermes webhook。"""
+    if not notifications_enabled():
+        return False
+
+    now = time.time()
+    last_sent = notification_last_sent.get(event_key, 0)
+    if now - last_sent < NOTIFICATION_COOLDOWN_SECONDS:
+        return False
+
+    webhook_url = get_notification_webhook_url()
+    text_lines = [title, *lines]
+    if media_path:
+        text_lines.append(f"MEDIA:{os.path.abspath(media_path)}")
+    text = "\n".join(text_lines)
+    try:
+        payload = json.dumps({"text": text}, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        notify_secret = os.environ.get("BILIBOT_HERMES_WEBHOOK_SECRET") or os.environ.get("BILIBOT_NOTIFY_WEBHOOK_SECRET")
+        if notify_secret:
+            signature = hmac.new(notify_secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+            headers["X-Hub-Signature-256"] = f"sha256={signature}"
+        response = requests.post(webhook_url, data=payload, headers=headers, timeout=8)
+        response.raise_for_status()
+        notification_last_sent[event_key] = now
+        log_handler.add_log(f"Hermes 通知已发送: {title}")
+        return True
+    except requests.RequestException as e:
+        log_handler.add_log(f"Hermes 通知发送失败: {str(e)}", "WARNING")
+        return False
+
+def can_send_status_notification(event_key):
+    return time.time() - notification_last_sent.get(event_key, 0) >= NOTIFICATION_COOLDOWN_SECONDS
+
+def notify_account_bad(account):
+    account_name = account.get("name", "未知账号")
+    recovery = ensure_login_recovery_qrcode(account)
+    event_key = f"account_bad:{account.get('index')}:{account.get('status')}"
+    lines = [
+        f"账号: {account_name}",
+        f"UID: {account.get('self_uid') or '-'}",
+        f"状态: {account.get('message')}",
+        f"检测时间: {account.get('checked_at')}",
+        f"处理入口: {get_panel_url()}",
+    ]
+    if recovery.get("success"):
+        lines.extend([
+            "已自动生成新的 B 站登录二维码，请用哔哩哔哩 App 扫码确认。",
+            "扫码确认后，本机程序会自动保存新 Cookie 并重启机器人。",
+        ])
+    else:
+        lines.append(f"二维码生成失败: {recovery.get('message', '未知错误')}，请进入账号管理手动扫码。")
+    send_status_notification(
+        event_key,
+        "BILIBOT 账号登录态异常",
+        lines,
+        media_path=recovery.get("image_path"),
+    )
+
+def notify_account_recovered(account):
+    account_name = account.get("name", "未知账号")
+    event_key = f"account_recovered:{account.get('index')}"
+    send_status_notification(
+        event_key,
+        "BILIBOT 账号登录态已恢复",
+        [
+            f"账号: {account_name}",
+            f"UID: {account.get('self_uid') or account.get('mid') or '-'}",
+            f"检测时间: {account.get('checked_at')}",
+        ],
+    )
+
+def bilibili_login_headers():
+    return {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Origin": "https://message.bilibili.com",
+        "Referer": "https://message.bilibili.com/",
+    }
+
+def save_qr_png(url, filename):
+    os.makedirs(LOGIN_QR_DIR, exist_ok=True)
+    image_path = os.path.join(LOGIN_QR_DIR, filename)
+    qr = qrcode.QRCode(
+        version=1,
+        error_correction=qrcode.constants.ERROR_CORRECT_L,
+        box_size=10,
+        border=4,
+    )
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
+    img.save(image_path, format="PNG")
+    return image_path
+
+def qr_image_to_data_uri(image_path):
+    with open(image_path, "rb") as f:
+        encoded = base64.b64encode(f.read()).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+def create_bilibili_login_qrcode(account_index):
+    url = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
+    response = requests.get(url, headers=bilibili_login_headers(), timeout=10)
+    response.raise_for_status()
+    qrcode_data = response.json()
+    if qrcode_data.get("code") != 0:
+        return {"success": False, "message": qrcode_data.get("message", "申请登录二维码失败")}
+
+    data = qrcode_data.get("data", {})
+    login_url = data.get("url")
+    qrcode_key = data.get("qrcode_key")
+    if not login_url or not qrcode_key:
+        return {"success": False, "message": "B站未返回二维码地址或 qrcode_key"}
+
+    filename = f"bilibili_login_{account_index}_{int(time.time())}.png"
+    image_path = save_qr_png(login_url, filename)
+    return {
+        "success": True,
+        "qrcode_key": qrcode_key,
+        "image_path": image_path,
+        "created_at": time.time(),
+        "expires_at": time.time() + 175,
+    }
+
+def ensure_login_recovery_qrcode(account):
+    if not is_truthy_env("BILIBOT_SEND_LOGIN_QR", True):
+        return {"success": False, "message": "自动二维码推送已关闭"}
+
+    account_index = account.get("index", 0)
+    existing = login_recovery_sessions.get(account_index)
+    if existing and existing.get("expires_at", 0) > time.time() and existing.get("status") == "waiting":
+        return existing
+
+    try:
+        recovery = create_bilibili_login_qrcode(account_index)
+        if not recovery.get("success"):
+            return recovery
+
+        recovery.update({
+            "status": "waiting",
+            "account_index": account_index,
+            "account_name": account.get("name", f"账号{account_index + 1}"),
+        })
+        login_recovery_sessions[account_index] = recovery
+        threading.Thread(
+            target=poll_login_recovery,
+            args=(account_index, recovery.get("qrcode_key")),
+            daemon=True
+        ).start()
+        log_handler.add_log(f"已为账号 {recovery['account_name']} 生成远程恢复登录二维码")
+        return recovery
+    except Exception as e:
+        log_handler.add_log(f"生成远程恢复登录二维码失败: {str(e)}", "ERROR")
+        return {"success": False, "message": str(e)}
+
+def poll_login_recovery(account_index, qrcode_key):
+    session = requests.Session()
+    url = "https://passport.bilibili.com/x/passport-login/web/qrcode/poll"
+    params = {"qrcode_key": qrcode_key}
+    headers = bilibili_login_headers()
+    deadline = time.time() + 180
+
+    while time.time() < deadline:
+        try:
+            response = session.get(url, params=params, headers=headers, timeout=10)
+            response.raise_for_status()
+            status_data = response.json()
+            data = status_data.get("data", {})
+            status_code = data.get("code")
+
+            if status_code == 0:
+                cookies_dict = session.cookies.get_dict()
+                sessdata = cookies_dict.get("SESSDATA")
+                bili_jct = cookies_dict.get("bili_jct")
+                if not sessdata or not bili_jct:
+                    log_handler.add_log("远程恢复登录成功但未获取到 Cookie", "ERROR")
+                    break
+                if apply_recovered_login(account_index, sessdata, bili_jct):
+                    login_recovery_sessions.pop(account_index, None)
+                    break
+                break
+
+            if status_code == 86038:
+                log_handler.add_log(f"账号 {account_index + 1} 远程恢复登录二维码已过期", "WARNING")
+                break
+
+            time.sleep(3)
+        except requests.RequestException as e:
+            log_handler.add_log(f"轮询远程恢复登录状态失败: {str(e)}", "WARNING")
+            time.sleep(5)
+        except ValueError:
+            log_handler.add_log("轮询远程恢复登录状态失败: B站返回非 JSON", "WARNING")
+            time.sleep(5)
+
+    recovery = login_recovery_sessions.get(account_index)
+    if recovery and recovery.get("qrcode_key") == qrcode_key:
+        recovery["status"] = "expired"
+
+def apply_recovered_login(account_index, sessdata, bili_jct):
+    accounts = bot_config.get_accounts()
+    if account_index < 0 or account_index >= len(accounts):
+        log_handler.add_log(f"远程恢复登录失败: 账号索引无效 {account_index}", "ERROR")
+        return False
+
+    account = accounts[account_index]
+    headers = bilibili_login_headers()
+    headers["Cookie"] = f"SESSDATA={sessdata}; bili_jct={bili_jct}; bili_ticket={bili_ticket.get()}"
+    try:
+        user_response = requests.get("https://api.bilibili.com/x/web-interface/nav", headers=headers, timeout=10)
+        user_response.raise_for_status()
+        user_data = user_response.json()
+    except (requests.RequestException, ValueError) as e:
+        log_handler.add_log(f"远程恢复登录后验证账号失败: {str(e)}", "ERROR")
+        return False
+
+    if user_data.get("code") != 0 or not user_data.get("data", {}).get("isLogin"):
+        log_handler.add_log(f"远程恢复登录后账号仍未登录: {user_data.get('message')}", "ERROR")
+        return False
+
+    nav_data = user_data.get("data", {})
+    account_config = account.setdefault("config", {})
+    account_config["sessdata"] = sessdata
+    account_config["bili_jct"] = bili_jct
+    account_config["self_uid"] = nav_data.get("mid", account_config.get("self_uid", 0))
+    bot_config.update_account(account_index, account)
+
+    account_health_cache["timestamp"] = 0
+    account_health_cache["result"] = None
+    log_handler.add_log(f"账号 {account.get('name', f'账号{account_index + 1}')} 远程扫码恢复成功: {nav_data.get('uname', '')}({nav_data.get('mid')})")
+    notify_account_recovered({
+        "index": account_index,
+        "name": account.get("name", f"账号{account_index + 1}"),
+        "self_uid": nav_data.get("mid"),
+        "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    restart_bot_mod()
+    return True
+
+def check_bilibili_account_health(account, index):
+    account_config = account.get("config", {})
+    account_name = account.get("name", f"账号{index + 1}")
+    self_uid = account_config.get("self_uid", 0)
+
+    result = {
+        "index": index,
+        "name": account_name,
+        "self_uid": self_uid,
+        "enabled": account.get("enabled", True),
+        "status": "unknown",
+        "message": "未检测",
+        "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    if not account.get("enabled", True):
+        result.update({"status": "disabled", "message": "账号已禁用"})
+        return result
+
+    sessdata = account_config.get("sessdata", "")
+    bili_jct = account_config.get("bili_jct", "")
+    if not sessdata or not bili_jct:
+        result.update({"status": "missing", "message": "Cookie 未配置完整"})
+        return result
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36",
+        "Referer": "https://www.bilibili.com/",
+        "Cookie": f"SESSDATA={sessdata}; bili_jct={bili_jct}; bili_ticket={bili_ticket.get()}"
+    }
+
+    try:
+        response = requests.get("https://api.bilibili.com/x/web-interface/nav", headers=headers, timeout=8)
+        if response.status_code != 200:
+            result.update({"status": "error", "message": f"检测失败 HTTP {response.status_code}"})
+            return result
+
+        data = response.json()
+        nav_data = data.get("data", {})
+        if data.get("code") == 0 and nav_data.get("isLogin") is True:
+            result.update({
+                "status": "ok",
+                "message": "登录正常",
+                "uname": nav_data.get("uname", ""),
+                "mid": nav_data.get("mid", self_uid)
+            })
+            return result
+
+        message = data.get("message") or "登录态已失效"
+        result.update({"status": "expired", "message": message})
+        return result
+    except requests.RequestException as e:
+        result.update({"status": "error", "message": f"检测异常: {e}"})
+        return result
+    except ValueError:
+        result.update({"status": "error", "message": "检测失败: B站返回非 JSON"})
+        return result
+
+def build_account_health(force=False):
+    now = time.time()
+    if (
+        not force
+        and account_health_cache["result"] is not None
+        and now - account_health_cache["timestamp"] < ACCOUNT_HEALTH_TTL
+    ):
+        return account_health_cache["result"]
+
+    accounts = bot_config.get_accounts()
+    health_accounts = [
+        check_bilibili_account_health(account, index)
+        for index, account in enumerate(accounts)
+    ]
+    bad_statuses = {"expired", "error", "missing"}
+    summary = {
+        "total": len(health_accounts),
+        "ok": sum(1 for account in health_accounts if account["status"] == "ok"),
+        "bad": sum(1 for account in health_accounts if account["status"] in bad_statuses),
+        "disabled": sum(1 for account in health_accounts if account["status"] == "disabled"),
+        "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    }
+
+    for account in health_accounts:
+        key = f"{account.get('index')}:{account.get('self_uid')}"
+        previous_status = account_health_last_status.get(key)
+        current_status = account.get("status")
+        if previous_status != current_status:
+            if current_status in bad_statuses:
+                log_handler.add_log(
+                    f"账号 {account.get('name')} 登录态异常: {account.get('message')}，请重新扫码登录",
+                    "WARNING"
+                )
+                notify_account_bad(account)
+            elif previous_status in bad_statuses and current_status == "ok":
+                log_handler.add_log(f"账号 {account.get('name')} 登录态恢复正常")
+                notify_account_recovered(account)
+            account_health_last_status[key] = current_status
+        elif current_status in bad_statuses:
+            event_key = f"account_bad:{account.get('index')}:{current_status}"
+            recovery = login_recovery_sessions.get(account.get("index"))
+            recovery_waiting = recovery and recovery.get("status") == "waiting" and recovery.get("expires_at", 0) > time.time()
+            if not recovery_waiting and can_send_status_notification(event_key):
+                notify_account_bad(account)
+
+    result = {
+        "success": True,
+        "accounts": health_accounts,
+        "summary": summary
+    }
+    account_health_cache["timestamp"] = now
+    account_health_cache["result"] = result
+    return result
+
+def account_health_monitor():
+    """后台巡检账号登录态，浏览器页面没打开时也能告警。"""
+    time.sleep(5)
+    while True:
+        try:
+            build_account_health(force=True)
+        except Exception as e:
+            log_handler.add_log(f"后台登录态巡检失败: {str(e)}", "ERROR")
+        time.sleep(max(60, ACCOUNT_HEALTH_MONITOR_INTERVAL))
+
 # 日志处理
 class LogHandler:
     def __init__(self, log_file):
@@ -444,46 +879,100 @@ class LogHandler:
 
 # 初始化日志处理器
 log_handler = LogHandler(LOG_FILE)
+threading.Thread(target=account_health_monitor, daemon=True).start()
+
+def get_bot_processes():
+    """查找当前项目下的机器人进程。"""
+    project_dir = os.path.abspath(os.getcwd())
+    script_path = os.path.join(project_dir, 'index.py')
+    processes = []
+    for proc in psutil.process_iter(['pid', 'cmdline']):
+        if proc.pid == os.getpid():
+            continue
+        cmdline = proc.info.get('cmdline') or []
+        has_index_script = any(
+            arg == 'index.py' or os.path.abspath(arg) == script_path
+            for arg in cmdline
+            if isinstance(arg, str)
+        )
+        if not has_index_script:
+            continue
+        try:
+            proc_cwd = os.path.abspath(proc.cwd())
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            proc_cwd = None
+        if proc_cwd == project_dir or any(os.path.abspath(arg) == script_path for arg in cmdline if isinstance(arg, str)):
+            processes.append(proc)
+    return processes
+
+def stop_bot_processes(timeout=10):
+    """停止所有当前项目下的机器人进程，避免多实例重复回复。"""
+    global bot_process, is_bot_running
+    processes = get_bot_processes()
+    for proc in processes:
+        try:
+            proc.terminate()
+        except psutil.NoSuchProcess:
+            pass
+    gone, alive = psutil.wait_procs(processes, timeout=timeout)
+    for proc in alive:
+        try:
+            proc.kill()
+        except psutil.NoSuchProcess:
+            pass
+    if alive:
+        psutil.wait_procs(alive, timeout=3)
+    bot_process = None
+    is_bot_running = False
+
+def start_bot_process():
+    """启动一个受面板管理的机器人进程。"""
+    global bot_process, is_bot_running
+    python_path = get_python3_path()
+    if not python_path:
+        log_handler.add_log("未找到python3解释器", "ERROR")
+        return False
+    bot_process = subprocess.Popen(
+        [python_path, 'index.py'],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        universal_newlines=True,
+        encoding='utf-8',
+        bufsize=1
+    )
+    threading.Thread(target=read_bot_output, daemon=True).start()
+    is_bot_running = True
+    return True
 
 def restart_bot_mod():
     """重启机器人"""
     global bot_process, is_bot_running
     
     try:
-        # 先停止机器人
-        if is_bot_running and bot_process:
-            bot_process.terminate()
-            try:
-                bot_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                bot_process.kill()
-                bot_process.wait()
-            is_bot_running = False
+        stop_bot_processes()
         
         # 等待一下确保进程完全停止
         time.sleep(2)
         
         # 再启动机器人
-        python_path = get_python3_path()
-        if not python_path:
-            log_handler.add_log("未找到python3解释器", "ERROR")
-        
-        bot_process = subprocess.Popen(
-            [python_path, 'index.py'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            encoding='utf-8',
-            bufsize=1
-        )
-        
-        # 启动日志读取线程
-        threading.Thread(target=read_bot_output, daemon=True).start()
-        
-        is_bot_running = True
+        start_bot_process()
     
     except Exception as e:
         log_handler.add_log(f"机器人重启失败: {str(e)}", "ERROR")
+
+def auto_start_bot_on_panel_start():
+    """面板作为服务启动时，自动拉起受面板管理的机器人进程。"""
+    if os.environ.get("BILIBOT_AUTO_START_BOT", "1") != "1":
+        log_handler.add_log("面板启动时自动启动机器人已关闭")
+        return
+    try:
+        stop_bot_processes()
+        if start_bot_process():
+            log_handler.add_log("面板启动时已自动启动机器人")
+        else:
+            log_handler.add_log("面板启动时自动启动机器人失败: 未找到python3解释器", "ERROR")
+    except Exception as e:
+        log_handler.add_log(f"面板启动时自动启动机器人失败: {str(e)}", "ERROR")
 
 def generate_qr_base64(url):
     """生成二维码并返回Base64字符串"""
@@ -572,7 +1061,7 @@ def get_accounts():
     global_keywords = bot_config.get_global_keywords()
     return jsonify({
         'code': '0',
-        'accounts': accounts,
+        'accounts': public_accounts(accounts),
         'global_keywords': global_keywords
     })
 
@@ -595,8 +1084,9 @@ def add_account():
             "keyword": account_data.get("keywords", {}),
             "at_user": account_data.get("at_user", False),
             "auto_focus": account_data.get("auto_focus", False),
+            "keyword_match_mode": account_data.get("keyword_match_mode", "contains"),
             "auto_reply_follow": account_data.get("auto_reply_follow", False),  # 新增
-            "no_focus_hf": account_data.get("no_focus_hf", False),
+            "no_focus_hf": account_data.get("no_focus_hf", True),
             "follow_reply_message": account_data.get("follow_reply_message", "感谢关注！"),  # 新增
             "enabled": account_data.get("enabled", True)
         }
@@ -754,20 +1244,28 @@ def update_account(account_index):
         # 获取原有账号的关键词
         existing_account = bot_config.get_account(account_index)
         existing_keywords = existing_account.get("keyword", {})
+        existing_config = existing_account.get("config", {})
+        sessdata = account_data.get("sessdata", "")
+        bili_jct = account_data.get("bili_jct", "")
+        if is_masked_secret(sessdata):
+            sessdata = existing_config.get("sessdata", "")
+        if is_masked_secret(bili_jct):
+            bili_jct = existing_config.get("bili_jct", "")
         
         updated_account = {
             "name": account_data.get("name", f"账号{account_index+1}"),
             "config": {
-                "sessdata": account_data.get("sessdata", ""),
-                "bili_jct": account_data.get("bili_jct", ""),
+                "sessdata": sessdata,
+                "bili_jct": bili_jct,
                 "self_uid": account_data.get("self_uid", 0),
                 "device_id": account_data.get("device_id", "")
             },
             "keyword": existing_keywords,  # 保留原有的关键词，不覆盖
             "at_user": account_data.get("at_user", False),
             "auto_focus": account_data.get("auto_focus", False),
+            "keyword_match_mode": account_data.get("keyword_match_mode", existing_account.get("keyword_match_mode", "contains")),
             "auto_reply_follow": account_data.get("auto_reply_follow", False),  # 新增
-            "no_focus_hf": account_data.get("no_focus_hf", False),
+            "no_focus_hf": account_data.get("no_focus_hf", True),
             "follow_reply_message": account_data.get("follow_reply_message", "感谢关注！"),  # 新增
             "enabled": account_data.get("enabled", True)
         }
@@ -1131,6 +1629,109 @@ def api_check():
     else:
         return jsonify({'logged_in': False}), 200
 
+@app.route('/api/account_health')
+@login_required
+def account_health():
+    """检查 B 站账号登录态。"""
+    force = request.args.get('force', '0') == '1'
+    try:
+        return jsonify(build_account_health(force=force))
+    except Exception as e:
+        log_handler.add_log(f"账号登录态检测失败: {str(e)}", "ERROR")
+        return jsonify({'success': False, 'message': f'检测失败: {str(e)}'})
+
+@app.route('/api/account/<int:account_index>/relogin_qrcode', methods=['POST'])
+@login_required
+def account_relogin_qrcode(account_index):
+    """为指定账号生成重新登录二维码。"""
+    accounts = bot_config.get_accounts()
+    if account_index < 0 or account_index >= len(accounts):
+        return jsonify({'success': False, 'message': '账号不存在'})
+
+    try:
+        recovery = create_bilibili_login_qrcode(account_index)
+        if not recovery.get("success"):
+            return jsonify({'success': False, 'message': recovery.get("message", "申请登录二维码失败")})
+
+        manual_relogin_sessions[account_index] = {
+            "qrcode_key": recovery.get("qrcode_key"),
+            "expires_at": recovery.get("expires_at", time.time() + 175),
+            "image_path": recovery.get("image_path"),
+        }
+        account_name = accounts[account_index].get("name", f"账号{account_index + 1}")
+        log_handler.add_log(f"已为账号 {account_name} 生成手动重新登录二维码")
+        return jsonify({
+            'success': True,
+            'data': {
+                'qrcode_img': qr_image_to_data_uri(recovery["image_path"]),
+                'qrcode_key': recovery["qrcode_key"],
+                'expires_at': recovery["expires_at"],
+            }
+        })
+    except Exception as e:
+        log_handler.add_log(f"生成手动重新登录二维码失败: {str(e)}", "ERROR")
+        return jsonify({'success': False, 'message': f'生成失败: {str(e)}'})
+
+@app.route('/api/account/<int:account_index>/relogin_qrcode_status')
+@login_required
+def account_relogin_qrcode_status(account_index):
+    """轮询指定账号重新登录二维码状态，成功后写回账号 Cookie。"""
+    qrcode_key = request.args.get('qrcode_key')
+    if not qrcode_key:
+        return jsonify({'success': False, 'message': 'qrcode_key不能为空'})
+
+    accounts = bot_config.get_accounts()
+    if account_index < 0 or account_index >= len(accounts):
+        return jsonify({'success': False, 'message': '账号不存在'})
+
+    session_info = manual_relogin_sessions.get(account_index)
+    if not session_info or session_info.get("qrcode_key") != qrcode_key:
+        return jsonify({'success': False, 'message': '重新登录会话不存在或已失效'})
+    if session_info.get("expires_at", 0) < time.time():
+        manual_relogin_sessions.pop(account_index, None)
+        return jsonify({'success': False, 'message': '二维码已过期', 'code': 86038})
+
+    try:
+        poll_session = requests.Session()
+        response = poll_session.get(
+            "https://passport.bilibili.com/x/passport-login/web/qrcode/poll",
+            params={"qrcode_key": qrcode_key},
+            headers=bilibili_login_headers(),
+            timeout=10,
+        )
+        response.raise_for_status()
+        status_data = response.json()
+        data = status_data.get("data", {})
+        status_code = data.get("code")
+
+        if status_code == 0:
+            cookies_dict = poll_session.cookies.get_dict()
+            sessdata = cookies_dict.get("SESSDATA")
+            bili_jct = cookies_dict.get("bili_jct")
+            if not sessdata or not bili_jct:
+                log_handler.add_log("重新登录成功但未获取到 Cookie", "ERROR")
+                return jsonify({'success': False, 'message': '登录成功但未获取到 Cookie'})
+            if not apply_recovered_login(account_index, sessdata, bili_jct):
+                return jsonify({'success': False, 'message': '登录后验证失败，请查看日志'})
+            manual_relogin_sessions.pop(account_index, None)
+            return jsonify({'success': True, 'message': '重新登录成功，账号 Cookie 已更新'})
+
+        if status_code == 86101:
+            return jsonify({'success': False, 'message': '等待扫码', 'code': 86101})
+        if status_code == 86090:
+            return jsonify({'success': False, 'message': '已扫码，请在手机上确认登录', 'code': 86090})
+        if status_code == 86038:
+            manual_relogin_sessions.pop(account_index, None)
+            return jsonify({'success': False, 'message': '二维码已过期', 'code': 86038})
+
+        return jsonify({'success': False, 'message': data.get("message", "未知状态"), 'code': status_code})
+    except requests.RequestException as e:
+        log_handler.add_log(f"检查重新登录二维码状态失败: {str(e)}", "ERROR")
+        return jsonify({'success': False, 'message': f'检查失败: {str(e)}'})
+    except ValueError:
+        log_handler.add_log("检查重新登录二维码状态失败: B站返回非 JSON", "ERROR")
+        return jsonify({'success': False, 'message': '检查失败: B站返回非 JSON'})
+
 @app.route("/error", methods=['GET', 'POST'])
 def Error():
     return render_template("error.html")
@@ -1161,7 +1762,7 @@ def get_bot_status():
     
     return jsonify({
         'running': is_bot_running,
-        'accounts': accounts,
+        'accounts': public_accounts(accounts),
         'enabled_accounts_count': len(enabled_accounts),
         'total_accounts_count': len(accounts),
         'global_keywords': bot_config.get_global_keywords()
@@ -1171,8 +1772,10 @@ def get_bot_status():
 @login_required
 def get_announcement():
     """获取远程公告"""
+    if os.environ.get("BILIBOT_ENABLE_REMOTE_CONTENT") != "1":
+        return jsonify({'success': True, 'message': '远程公告已关闭'})
     try:
-        response = requests.get(ConfigManage.base64_decode("aHR0cDovLzExNC4xMzQuMTg4LjE4OD9pZD0y"))
+        response = requests.get(ConfigManage.base64_decode("aHR0cDovLzExNC4xMzQuMTg4LjE4OD9pZD0y"), timeout=10)
         response.raise_for_status()
         data = response.text
         return jsonify({'success': True, 'message': data})
@@ -1186,29 +1789,13 @@ def start_bot():
     """启动机器人"""
     global bot_process, is_bot_running
     
-    if is_bot_running:
+    if is_bot_running and bot_process and bot_process.poll() is None:
         return jsonify({'success': False, 'message': '机器人已在运行中'})
     
     try:
-        python_path = get_python3_path()
-        if not python_path:
-            log_handler.add_log("未找到python3解释器", "ERROR")
+        stop_bot_processes()
+        if not start_bot_process():
             return jsonify({'success': False, 'message': '未找到python3解释器'})
-        
-        # 启动机器人进程
-        bot_process = subprocess.Popen(
-            [python_path, 'index.py'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            encoding='utf-8',
-            bufsize=1
-        )
-        
-        # 启动日志读取线程
-        threading.Thread(target=read_bot_output, daemon=True).start()
-        
-        is_bot_running = True
         log_handler.add_log("机器人启动成功")
         
         return jsonify({'success': True, 'message': '机器人启动成功'})
@@ -1223,20 +1810,11 @@ def stop_bot():
     """停止机器人"""
     global bot_process, is_bot_running
     
-    if not is_bot_running:
+    if not is_bot_running and not get_bot_processes():
         return jsonify({'success': False, 'message': '机器人未在运行'})
     
     try:
-        # 终止进程
-        if bot_process:
-            bot_process.terminate()
-            try:
-                bot_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                bot_process.kill()
-                bot_process.wait()
-        
-        is_bot_running = False
+        stop_bot_processes()
         log_handler.add_log("机器人已停止")
         
         return jsonify({'success': True, 'message': '机器人已停止'})
@@ -1496,8 +2074,8 @@ def github_logout():
             client_id=github_config.get('client_id', ''),
             client_secret=github_config.get('client_secret', ''),
             access_token="",  # 清空访问令牌
-            repo_owner=github_config.get('repo_owner', '7Hello80'),
-            repo_name=github_config.get('repo_name', 'Bilibili_PrivateMessage_Bot')
+            repo_owner=github_config.get('repo_owner', 'heishiqing'),
+            repo_name=github_config.get('repo_name', 'Vbot')
         )
         
         # 重新初始化 GitHub 客户端
@@ -1595,8 +2173,8 @@ def github_config():
         # 不返回client_secret
         safe_config = {
             'client_id': github_config.get('client_id', ''),
-            'repo_owner': github_config.get('repo_owner', '7Hello80'),
-            'repo_name': github_config.get('repo_name', 'Bilibili_PrivateMessage_Bot'),
+            'repo_owner': github_config.get('repo_owner', 'heishiqing'),
+            'repo_name': github_config.get('repo_name', 'Vbot'),
             'is_authenticated': github_manager.is_authenticated()
         }
         return jsonify({'success': True, 'config': safe_config})
@@ -1827,38 +2405,14 @@ def restart_bot():
     global bot_process, is_bot_running
     
     try:
-        # 先停止机器人
-        if is_bot_running and bot_process:
-            bot_process.terminate()
-            try:
-                bot_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                bot_process.kill()
-                bot_process.wait()
-            is_bot_running = False
+        stop_bot_processes()
         
         # 等待一下确保进程完全停止
         time.sleep(2)
         
         # 再启动机器人
-        python_path = get_python3_path()
-        if not python_path:
-            log_handler.add_log("未找到python3解释器", "ERROR")
+        if not start_bot_process():
             return jsonify({'success': False, 'message': '未找到python3解释器'})
-        
-        bot_process = subprocess.Popen(
-            [python_path, 'index.py'],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            encoding='utf-8',
-            bufsize=1
-        )
-        
-        # 启动日志读取线程
-        threading.Thread(target=read_bot_output, daemon=True).start()
-        
-        is_bot_running = True
         log_handler.add_log("机器人重启成功")
         
         return jsonify({'success': True, 'message': '机器人重启成功'})
@@ -1882,6 +2436,34 @@ def get_logs():
     limit = request.args.get('limit', 100, type=int)
     logs = log_handler.get_logs(limit)
     return jsonify({'logs': logs})
+
+@app.route('/api/message_activity')
+@login_required
+def message_activity():
+    """获取最近的私信处理状态"""
+    limit = request.args.get('limit', 20, type=int)
+    try:
+        if not os.path.exists(ACTIVITY_FILE):
+            return jsonify({'success': True, 'last_event': None, 'events': []})
+        with open(ACTIVITY_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        events = data.get('events', [])
+        if not isinstance(events, list):
+            events = []
+        summary = data.get('summary')
+        if not isinstance(summary, dict):
+            summary = {
+                'replied': sum(1 for event in events if isinstance(event, dict) and event.get('status') == 'replied')
+            }
+        return jsonify({
+            'success': True,
+            'last_event': data.get('last_event'),
+            'events': events[-limit:],
+            'summary': summary
+        })
+    except (json.JSONDecodeError, OSError) as e:
+        log_handler.add_log(f"读取私信处理状态失败: {str(e)}", "ERROR")
+        return jsonify({'success': False, 'message': f'读取失败: {str(e)}'})
 
 @app.route('/api/clear_logs', methods=['POST'])
 @login_required
@@ -1979,6 +2561,11 @@ def create_templates():
     templates_dir = 'templates'
     if not os.path.exists(templates_dir):
         os.makedirs(templates_dir)
+
+    template_files = ['error.html', 'base.html', 'login.html', 'index.html']
+    templates_exist = all(os.path.exists(os.path.join(templates_dir, name)) for name in template_files)
+    if templates_exist and os.environ.get("BILIBOT_REGENERATE_TEMPLATES") != "1":
+        return
     
     # 创建错误页面
     with open(os.path.join(templates_dir, 'error.html'), 'w', encoding='utf-8') as f:
@@ -2249,7 +2836,7 @@ def create_templates():
                 <i class="fa fa-images text-gray-400 w-5"></i>
                 <span>图床管理</span>
             </a>
-            <a href="https://github.com/7Hello80/Bilibili_PrivateMessage_Bot" target="_blank" class="nav-item flex items-center space-x-3 px-4 py-3 text-gray-600 hover:bg-gray-50 rounded-lg transition">
+            <a href="https://github.com/heishiqing/Vbot" target="_blank" class="nav-item flex items-center space-x-3 px-4 py-3 text-gray-600 hover:bg-gray-50 rounded-lg transition">
                 <i class="fab fa-github text-gray-800 w-5"></i>
                 <span>GitHub仓库</span>
             </a>
@@ -2488,19 +3075,19 @@ def create_templates():
                 <h3 class="text-lg font-medium text-gray-800 mb-4">项目Github数据</h3>
                 <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
                     <p align="center" class="display flex">
-                        <a href="https://github.com/7Hello80/Bilibili_PrivateMessage_Bot/issues" style="text-decoration:none; margin: auto .5em;">
-                            <img src="https://img.shields.io/github/issues/7Hello80/Bilibili_PrivateMessage_Bot.svg?style=flat&amp;color=red" alt="GitHub issues">
+                        <a href="https://github.com/heishiqing/Vbot/issues" style="text-decoration:none; margin: auto .5em;">
+                            <img src="https://img.shields.io/github/issues/heishiqing/Vbot.svg?style=flat&amp;color=red" alt="GitHub issues">
                         </a>
-                        <a href="https://github.com/7Hello80/Bilibili_PrivateMessage_Bot/stargazers" style="text-decoration:none; margin: auto .5em;">
-                            <img src="https://img.shields.io/github/stars/7Hello80/Bilibili_PrivateMessage_Bot.svg?style=flat&amp;color=yellow" alt="GitHub stars">
+                        <a href="https://github.com/heishiqing/Vbot/stargazers" style="text-decoration:none; margin: auto .5em;">
+                            <img src="https://img.shields.io/github/stars/heishiqing/Vbot.svg?style=flat&amp;color=yellow" alt="GitHub stars">
                         </a>
-                        <a href="https://github.com/7Hello80/Bilibili_PrivateMessage_Bot/network" style="text-decoration:none; margin: auto .5em;">
-                            <img src="https://img.shields.io/github/forks/7Hello80/Bilibili_PrivateMessage_Bot.svg?style=flat&amp;color=blue" alt="GitHub forks">
+                        <a href="https://github.com/heishiqing/Vbot/network" style="text-decoration:none; margin: auto .5em;">
+                            <img src="https://img.shields.io/github/forks/heishiqing/Vbot.svg?style=flat&amp;color=blue" alt="GitHub forks">
                         </a>
-                        <a href="https://github.com/7Hello80/Bilibili_PrivateMessage_Bot/blob/master/LICENSE" style="text-decoration:none; margin: auto .5em;">
+                        <a href="https://github.com/heishiqing/Vbot/blob/master/LICENSE" style="text-decoration:none; margin: auto .5em;">
                             <img src="https://img.shields.io/badge/License-MIT-lightgrey.svg?style=flat" alt="GitHub license">
                         </a>
-                        <a href="https://github.com/7Hello80/Bilibili_PrivateMessage_Bot/" style="margin: auto .5em; color: #238b8b;">
+                        <a href="https://github.com/heishiqing/Vbot/" style="margin: auto .5em; color: #238b8b;">
                             <u>如果喜欢请各位点个免费的 Star 吧！</u>
                         </a>
                     </p>
@@ -3299,11 +3886,11 @@ def create_templates():
                         Copyright &copy; 2025 淡意往事.
                     </p>
                     <p class="text-xs text-gray-500 mt-1">
-                        使用 <a href="https://github.com/7Hello80/Bilibili_PrivateMessage_Bot/blob/main/LICENSE" target="_blank" class="text-gray-700 hover:text-gray-600 transition" title="MIT许可协议">MIT许可协议</a> 开放源代码
+                        使用 <a href="https://github.com/heishiqing/Vbot/blob/main/LICENSE" target="_blank" class="text-gray-700 hover:text-gray-600 transition" title="MIT许可协议">MIT许可协议</a> 开放源代码
                     </p>
                 </div>
                 <div class="flex items-center space-x-4">
-                    <a href="https://github.com/7Hello80/Bilibili_PrivateMessage_Bot" target="_blank" class="text-gray-700 hover:text-gray-600 transition" title="GitHub">
+                    <a href="https://github.com/heishiqing/Vbot" target="_blank" class="text-gray-700 hover:text-gray-600 transition" title="GitHub">
                         <i class="fab fa-github text-lg"></i>
                     </a>
                     <a href="https://space.bilibili.com/2142524663?spm_id_from=333.1007.0.0" target="_blank" class="text-gray-700 hover:text-bilibili transition" title="Bilibili">
@@ -3403,7 +3990,7 @@ def create_templates():
                                     <label for="account-auto-focus" class="ml-2 text-sm text-gray-700">自动关注</label>
                                 </div>
                                 <div class="flex items-center">
-                                    <input type="checkbox" name="no_focus_hf" id="account-no-focus"
+                                    <input type="checkbox" name="no_focus_hf" id="account-no-focus" checked
                                            class="w-4 h-4 text-primary-600 border-gray-300 rounded focus:ring-primary-500">
                                     <label for="account-no-focus" class="ml-2 text-sm text-gray-700">开启未关注也回复功能</label>
                                 </div>
@@ -3752,12 +4339,12 @@ def create_templates():
                         <div class="grid grid-cols-2 gap-4">
                             <div>
                                 <label class="block text-sm font-medium text-gray-700 mb-2">仓库所有者</label>
-                                <input type="text" name="repo_owner" value="7Hello80"
+                                <input type="text" name="repo_owner" value="heishiqing"
                                        class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition">
                             </div>
                             <div>
                                 <label class="block text-sm font-medium text-gray-700 mb-2">仓库名称</label>
-                                <input type="text" name="repo_name" value="Bilibili_PrivateMessage_Bot"
+                                <input type="text" name="repo_name" value="Vbot"
                                        class="w-full px-4 py-3 border border-gray-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 transition">
                             </div>
                         </div>
@@ -3882,6 +4469,7 @@ def create_templates():
 if __name__ == '__main__':
     # 创建模板文件
     create_templates()
+    auto_start_bot_on_panel_start()
     
     # 启动Flask应用
     print(f"{Fore.GREEN}访问地址: http://127.0.0.1:5000")
@@ -3890,4 +4478,8 @@ if __name__ == '__main__':
     print(f"{Fore.GREEN}请及时修改默认密码！")
     
     # 关闭调试模式，避免重启
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    app.run(
+        debug=False,
+        host=os.environ.get('BILIBOT_HOST', '127.0.0.1'),
+        port=int(os.environ.get('BILIBOT_PORT', '5000'))
+    )
