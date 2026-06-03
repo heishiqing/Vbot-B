@@ -29,7 +29,7 @@ Vbot 是基于 [@7Hello80/Bilibili_PrivateMessage_Bot v1.1.1](https://github.com
 
 ```bash
 git clone https://github.com/heishiqing/Vbot-B.git
-cd Vbot
+cd Vbot-B
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
