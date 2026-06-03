@@ -478,6 +478,14 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // 显示指定部分，隐藏其他部分
 function showSection(sectionId) {
+    // 2026-06-03 owner 修: 'about' 加白名单, 原版只允许 dashboard/accounts/logs
+    // 导致侧栏"❤ 关于·支持作者"按钮点了被强制 fallback 到 dashboard, 死活进不去
+    const allowedSections = new Set(['dashboard', 'accounts', 'logs', 'about']);
+    if (!allowedSections.has(sectionId)) {
+        sectionId = 'dashboard';
+        window.location.hash = '#dashboard';
+    }
+
     // 隐藏所有部分
     document.querySelectorAll('.section').forEach(section => {
         section.style.display = 'none';
@@ -2217,6 +2225,7 @@ function showAddAccountModal() {
     document.getElementById('add-account-modal').classList.remove('hidden');
 
     document.getElementById('add-account-auto-reply-follow').checked = false;
+    document.getElementById('account-no-focus').checked = true;
     document.getElementById('add-account-follow-reply-message').value = '感谢关注！';
     document.getElementById('add-follow-reply-container').classList.add('hidden');
 }
@@ -2339,6 +2348,128 @@ function cancelQrcodeLogin() {
     document.getElementById('start-qrcode-login').classList.remove('hidden');
 }
 
+let reloginPolling = null;
+let reloginLayerIndex = null;
+
+function stopReloginPolling() {
+    if (reloginPolling) {
+        clearInterval(reloginPolling);
+        reloginPolling = null;
+    }
+}
+
+function setReloginStatus(message, className = 'text-gray-600') {
+    const statusEl = document.getElementById('relogin-qrcode-status');
+    if (!statusEl) return;
+    statusEl.className = `text-sm ${className}`;
+    statusEl.textContent = message;
+}
+
+function reloginAccount(accountIndex) {
+    stopReloginPolling();
+    const account = accountHealthByIndex[accountIndex];
+    const accountName = account && account.name ? account.name : `账号${accountIndex + 1}`;
+
+    reloginLayerIndex = layer.open({
+        type: 1,
+        title: '重新登录 B 站账号',
+        area: ['360px', '460px'],
+        shadeClose: true,
+        end: stopReloginPolling,
+        content: `
+            <div class="p-5">
+                <div class="mb-4">
+                    <div class="text-base font-medium text-gray-800">${escapeHtml(accountName)}</div>
+                    <div class="text-sm text-gray-500 mt-1">用哔哩哔哩 App 扫码确认后，会自动写回该账号 Cookie。</div>
+                </div>
+                <div class="text-center border border-gray-200 rounded-lg p-4 bg-gray-50">
+                    <div class="w-56 h-56 mx-auto flex items-center justify-center bg-white border border-gray-200 rounded">
+                        <img id="relogin-qrcode-img" src="" alt="重新登录二维码" class="max-w-full max-h-full hidden">
+                        <i id="relogin-qrcode-loading" class="fa fa-spinner fa-spin text-2xl text-gray-400"></i>
+                    </div>
+                    <p id="relogin-qrcode-status" class="text-sm text-gray-600 mt-3">正在生成二维码...</p>
+                </div>
+                <div class="mt-4 flex justify-end space-x-2">
+                    <button type="button" onclick="reloginAccount(${accountIndex})" class="px-4 py-2 bg-bilibili text-white rounded-lg hover:bg-blue-700 transition">
+                        重新生成
+                    </button>
+                    <button type="button" onclick="stopReloginPolling(); layer.close(reloginLayerIndex)" class="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition">
+                        关闭
+                    </button>
+                </div>
+            </div>
+        `
+    });
+
+    fetch(`/api/account/${accountIndex}/relogin_qrcode`, { method: 'POST' })
+        .then(response => response.json())
+        .then(data => {
+            const imgEl = document.getElementById('relogin-qrcode-img');
+            const loadingEl = document.getElementById('relogin-qrcode-loading');
+            if (!data.success) {
+                if (loadingEl) loadingEl.classList.add('hidden');
+                setReloginStatus(data.message || '二维码生成失败', 'text-red-600');
+                return;
+            }
+
+            if (imgEl) {
+                imgEl.src = data.data.qrcode_img;
+                imgEl.classList.remove('hidden');
+            }
+            if (loadingEl) loadingEl.classList.add('hidden');
+            setReloginStatus('请使用哔哩哔哩 App 扫码登录');
+            startReloginPolling(accountIndex, data.data.qrcode_key);
+        })
+        .catch(error => {
+            console.error('生成重新登录二维码失败:', error);
+            setReloginStatus('二维码生成失败，请检查网络连接', 'text-red-600');
+        });
+}
+
+function startReloginPolling(accountIndex, qrcodeKey) {
+    stopReloginPolling();
+    reloginPolling = setInterval(() => {
+        fetch(`/api/account/${accountIndex}/relogin_qrcode_status?qrcode_key=${encodeURIComponent(qrcodeKey)}`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    stopReloginPolling();
+                    setReloginStatus('重新登录成功，正在刷新账号状态...', 'text-green-600');
+                    showNotification('重新登录成功，账号 Cookie 已更新', 'success');
+                    fetchAccountHealth(true);
+                    loadAccounts();
+                    fetchBotStatus();
+                    setTimeout(() => {
+                        if (reloginLayerIndex !== null) {
+                            layer.close(reloginLayerIndex);
+                            reloginLayerIndex = null;
+                        }
+                    }, 1200);
+                    return;
+                }
+
+                switch (data.code) {
+                    case 86101:
+                        setReloginStatus('等待扫码...');
+                        break;
+                    case 86090:
+                        setReloginStatus('已扫码，请在手机上确认登录', 'text-yellow-600');
+                        break;
+                    case 86038:
+                        stopReloginPolling();
+                        setReloginStatus('二维码已过期，请重新生成', 'text-red-600');
+                        break;
+                    default:
+                        setReloginStatus(data.message || '未知状态', 'text-red-600');
+                }
+            })
+            .catch(error => {
+                console.error('检查重新登录状态失败:', error);
+                setReloginStatus('检查状态失败，请重试', 'text-red-600');
+            });
+    }, 2000);
+}
+
 // 为扫码登录按钮添加事件监听
 document.addEventListener('DOMContentLoaded', function() {
     const startButton = document.getElementById('start-qrcode-login');
@@ -2357,7 +2488,7 @@ function loadAccounts() {
     fetch('/api/get_accounts')
         .then(response => response.json())
         .then(data => {
-            updateAccountsList(data.accounts);
+            updateAccountsList(data.accounts, accountHealthByIndex);
             updateGlobalKeywordsList(data.global_keywords);
         })
         .catch(error => {
@@ -2365,7 +2496,88 @@ function loadAccounts() {
         });
 }
 
-function updateAccountsList(accounts) {
+let accountHealthByIndex = {};
+
+function getAccountHealthMeta(status) {
+    const meta = {
+        ok: { text: '登录正常', classes: 'bg-green-100 text-green-700', icon: 'fa-check-circle' },
+        expired: { text: '登录失效', classes: 'bg-red-100 text-red-700', icon: 'fa-exclamation-circle' },
+        error: { text: '检测失败', classes: 'bg-yellow-100 text-yellow-700', icon: 'fa-exclamation-triangle' },
+        missing: { text: '未配置', classes: 'bg-red-100 text-red-700', icon: 'fa-exclamation-circle' },
+        disabled: { text: '已禁用', classes: 'bg-gray-100 text-gray-600', icon: 'fa-ban' },
+        unknown: { text: '未检测', classes: 'bg-gray-100 text-gray-600', icon: 'fa-question-circle' }
+    };
+    return meta[status] || meta.unknown;
+}
+
+function renderAccountHealthBadge(health) {
+    const meta = getAccountHealthMeta(health && health.status);
+    const message = health && health.message ? health.message : meta.text;
+    return `
+        <span title="${escapeHtml(message)}" class="text-sm px-2 py-1 rounded ${meta.classes}">
+            <i class="fa ${meta.icon} mr-1"></i>${meta.text}
+        </span>
+    `;
+}
+
+function renderAccountLoginStatus(summary) {
+    const statusEl = document.getElementById('account-login-status');
+    const iconEl = document.getElementById('account-login-icon');
+    if (!statusEl || !iconEl) return;
+
+    if (!summary || summary.total === 0) {
+        statusEl.textContent = '无账号';
+        statusEl.className = 'text-xl font-semibold text-gray-800';
+        iconEl.className = 'p-3 rounded-xl bg-gray-100 text-gray-600';
+        return;
+    }
+
+    if (summary.bad > 0) {
+        statusEl.textContent = `${summary.bad} 异常`;
+        statusEl.className = 'text-xl font-semibold text-red-600';
+        iconEl.className = 'p-3 rounded-xl bg-red-100 text-red-600';
+        return;
+    }
+
+    if (summary.ok > 0) {
+        statusEl.textContent = '正常';
+        statusEl.className = 'text-xl font-semibold text-green-600';
+        iconEl.className = 'p-3 rounded-xl bg-green-100 text-green-600';
+        return;
+    }
+
+    statusEl.textContent = '未检测';
+    statusEl.className = 'text-xl font-semibold text-gray-800';
+    iconEl.className = 'p-3 rounded-xl bg-gray-100 text-gray-600';
+}
+
+function fetchAccountHealth(force = false) {
+    fetch(`/api/account_health${force ? '?force=1' : ''}`)
+        .then(response => response.json())
+        .then(data => {
+            if (!data.success) {
+                showNotification(data.message || '账号登录态检测失败', 'error');
+                return;
+            }
+
+            accountHealthByIndex = {};
+            (data.accounts || []).forEach(health => {
+                accountHealthByIndex[health.index] = health;
+            });
+            renderAccountLoginStatus(data.summary);
+
+            const accountsSection = document.getElementById('accounts');
+            if (accountsSection && accountsSection.style.display !== 'none') {
+                loadAccounts();
+            }
+        })
+        .catch(error => {
+            console.error('账号登录态检测失败:', error);
+            renderAccountLoginStatus({ total: 1, ok: 0, bad: 1 });
+        });
+}
+
+function updateAccountsList(accounts, healthByIndex = {}) {
     const container = document.getElementById('accounts-list');
     if (!container) return;
     
@@ -2383,10 +2595,11 @@ function updateAccountsList(accounts) {
     container.innerHTML = accounts.map((account, index) => `
         <div class="border border-gray-200 rounded-lg p-4 mb-4 bg-white hover:bg-gray-50 transition">
             <div class="flex items-center justify-between mb-3">
-                <div class="flex items-center space-x-3">
+                <div class="flex items-center space-x-3 flex-wrap">
                     <div class="w-3 h-3 rounded-full ${account.enabled ? 'bg-green-500' : 'bg-gray-400'}"></div>
-                    <h4 class="text-lg font-medium text-gray-800">${account.name}</h4>
+                    <h4 class="text-lg font-medium text-gray-800">${escapeHtml(account.name)}</h4>
                     <span class="text-sm px-2 py-1 bg-blue-100 text-blue-800 rounded">UID: ${account.config.self_uid}</span>
+                    ${renderAccountHealthBadge(healthByIndex[index])}
                 </div>
                 <div class="flex items-center space-x-2">
                     <button onclick="toggleAccount(${index})" 
@@ -2396,6 +2609,10 @@ function updateAccountsList(accounts) {
                     <button onclick="editAccount(${index})" 
                             class="px-3 py-1 text-sm bg-blue-600 hover:bg-blue-700 text-white rounded transition">
                         编辑
+                    </button>
+                    <button onclick="reloginAccount(${index})" 
+                            class="px-3 py-1 text-sm bg-purple-600 hover:bg-purple-700 text-white rounded transition">
+                        重新登录
                     </button>
                     <button onclick="deleteAccount(${index})" 
                             class="px-3 py-1 text-sm bg-red-600 hover:bg-red-700 text-white rounded transition">
@@ -2452,17 +2669,37 @@ function updateGlobalKeywordsList(keywords) {
     }
     
     container.innerHTML = Object.entries(keywords).map(([keyword, reply]) => `
-        <div class="flex items-center justify-between p-3 border border-gray-200 rounded-lg mb-2">
+        <div class="global-keyword-item flex items-center justify-between p-3 border border-gray-200 rounded-lg mb-2"
+             data-keyword="${encodeURIComponent(keyword)}"
+             data-reply="${encodeURIComponent(reply)}">
             <div class="flex-1">
-                <div class="font-medium text-gray-800">${keyword}</div>
-                <div class="text-sm text-gray-600">${reply}</div>
+                <div class="font-medium text-gray-800">${escapeHtml(keyword)}</div>
+                <div class="text-sm text-gray-600 whitespace-pre-wrap">${escapeHtml(reply)}</div>
             </div>
-            <button onclick="deleteGlobalKeyword('${keyword}')" 
-                    class="ml-4 px-3 py-1 bg-red-600 text-white rounded text-sm hover:bg-red-700 transition">
-                <i class="fa fa-trash"></i>
-            </button>
+            <div class="flex space-x-2 ml-4">
+                <button type="button" class="edit-global-keyword-btn px-3 py-1 bg-blue-600 text-white rounded text-sm hover:bg-blue-700 transition">
+                    <i class="fa fa-edit"></i>
+                </button>
+                <button type="button" class="delete-global-keyword-btn px-3 py-1 bg-red-600 text-white rounded text-sm hover:bg-red-700 transition">
+                    <i class="fa fa-trash"></i>
+                </button>
+            </div>
         </div>
     `).join('');
+
+    container.onclick = function(e) {
+        const keywordItem = e.target.closest('.global-keyword-item');
+        if (!keywordItem) return;
+
+        const keyword = decodeURIComponent(keywordItem.getAttribute('data-keyword'));
+        const reply = decodeURIComponent(keywordItem.getAttribute('data-reply'));
+
+        if (e.target.closest('.edit-global-keyword-btn')) {
+            openEditKeywordModal(keyword, reply, 'global');
+        } else if (e.target.closest('.delete-global-keyword-btn')) {
+            deleteGlobalKeyword(keyword);
+        }
+    };
 }
 
 function get_announcement() {
@@ -2684,10 +2921,12 @@ function deleteAccountKeyword(keyword) {
 
 // 当前编辑的关键词
 let currentEditingKeyword = null;
+let currentEditingKeywordScope = 'account';
 
 // 打开修改关键词模态框
-function openEditKeywordModal(keyword, reply) {
+function openEditKeywordModal(keyword, reply, scope = 'account') {
     currentEditingKeyword = keyword;
+    currentEditingKeywordScope = scope;
     
     // 填充表单数据
     document.getElementById('edit-original-keyword').value = keyword;
@@ -2702,6 +2941,7 @@ function openEditKeywordModal(keyword, reply) {
 function hideEditKeywordModal() {
     document.getElementById('edit-keyword-modal').classList.add('hidden');
     currentEditingKeyword = null;
+    currentEditingKeywordScope = 'account';
     document.getElementById('edit-keyword-form').reset();
 }
 
@@ -2713,6 +2953,11 @@ function saveKeywordEdit(formData) {
     
     if (!newKeyword || !newReply) {
         showNotification('关键词和回复内容不能为空', 'error');
+        return;
+    }
+
+    if (currentEditingKeywordScope === 'global') {
+        saveGlobalKeywordEdit(originalKeyword, newKeyword, newReply);
         return;
     }
     
@@ -2764,6 +3009,37 @@ function saveKeywordEdit(formData) {
         console.error('修改关键词失败:', error);
         showNotification('修改关键词失败: ' + error.message, 'error');
     });
+}
+
+function saveGlobalKeywordEdit(originalKeyword, newKeyword, newReply) {
+    fetch('/api/get_accounts')
+        .then(response => response.json())
+        .then(data => {
+            const globalKeywords = data.global_keywords || {};
+            if (originalKeyword !== newKeyword) {
+                delete globalKeywords[originalKeyword];
+            }
+            globalKeywords[newKeyword] = newReply;
+
+            return fetch('/api/update_global_keywords', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(globalKeywords)
+            });
+        })
+        .then(response => response.json())
+        .then(data => {
+            showNotification(data.message, data.success ? 'success' : 'error');
+            if (data.success) {
+                hideEditKeywordModal();
+                loadAccounts();
+                fetchBotStatus();
+            }
+        })
+        .catch(error => {
+            console.error('修改全局关键词失败:', error);
+            showNotification('修改全局关键词失败: ' + error.message, 'error');
+        });
 }
 
 function deleteAccount(index) {
@@ -3089,7 +3365,7 @@ function fetchBotStatus() {
             // 如果是在账号管理页面，更新账号列表
             const accountsSection = document.getElementById('accounts');
             if (accountsSection && accountsSection.style.display !== 'none') {
-                updateAccountsList(data.accounts);
+                updateAccountsList(data.accounts, accountHealthByIndex);
                 updateGlobalKeywordsList(data.global_keywords);
             }
         })
@@ -3099,6 +3375,109 @@ function fetchBotStatus() {
             if (statusText) {
                 statusText.innerHTML = '<span class="text-red-600">获取状态失败</span>';
             }
+        });
+}
+
+function escapeHtml(value) {
+    return String(value || '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;');
+}
+
+function getActivityStatusMeta(status) {
+    const meta = {
+        replied: { text: '回复成功', badge: 'bg-green-100 text-green-700', dot: 'bg-green-500' },
+        reply_failed: { text: '回复失败', badge: 'bg-red-100 text-red-700', dot: 'bg-red-500' },
+        unmatched: { text: '未命中关键词', badge: 'bg-yellow-100 text-yellow-700', dot: 'bg-yellow-500' },
+        blocked: { text: '未发送', badge: 'bg-orange-100 text-orange-700', dot: 'bg-orange-500' }
+    };
+    return meta[status] || { text: '等待消息', badge: 'bg-gray-100 text-gray-600', dot: 'bg-gray-400' };
+}
+
+function renderLatestActivity(event) {
+    const empty = document.getElementById('message-activity-empty');
+    const latest = document.getElementById('message-activity-latest');
+    const badge = document.getElementById('message-activity-badge');
+
+    if (!empty || !latest || !badge) return;
+
+    if (!event) {
+        empty.classList.remove('hidden');
+        latest.classList.add('hidden');
+        badge.className = 'px-3 py-1 rounded-full text-sm bg-gray-100 text-gray-600';
+        badge.textContent = '等待消息';
+        return;
+    }
+
+    const meta = getActivityStatusMeta(event.status);
+    empty.classList.add('hidden');
+    latest.classList.remove('hidden');
+    badge.className = `px-3 py-1 rounded-full text-sm ${meta.badge}`;
+    badge.textContent = meta.text;
+
+    document.getElementById('activity-time').textContent = event.time || '--';
+    document.getElementById('activity-talker').textContent = event.talker_id || '--';
+    document.getElementById('activity-keyword').textContent = event.matched_keyword || '未命中';
+    document.getElementById('activity-detail').textContent = event.detail || meta.text;
+    document.getElementById('activity-message').textContent = event.message || '';
+    document.getElementById('activity-reply').textContent = event.reply || '';
+}
+
+function renderActivityList(events) {
+    const list = document.getElementById('message-activity-list');
+    if (!list) return;
+
+    if (!events || events.length === 0) {
+        list.innerHTML = '<div class="text-center text-gray-500 py-6">暂无记录</div>';
+        return;
+    }
+
+    list.innerHTML = events.slice().reverse().map(event => {
+        const meta = getActivityStatusMeta(event.status);
+        return `
+            <div class="border border-gray-100 rounded-lg p-3">
+                <div class="flex items-center justify-between mb-2">
+                    <div class="flex items-center">
+                        <span class="w-2 h-2 rounded-full ${meta.dot} mr-2"></span>
+                        <span class="font-medium text-gray-800">${escapeHtml(meta.text)}</span>
+                    </div>
+                    <span class="text-xs text-gray-500">${escapeHtml(event.time || '')}</span>
+                </div>
+                <div class="text-xs text-gray-500 mb-1">UID: ${escapeHtml(event.talker_id || '--')}</div>
+                <div class="text-sm text-gray-700 truncate">${escapeHtml(event.message || '')}</div>
+            </div>
+        `;
+    }).join('');
+}
+
+function updateSuccessfulRepliesCount(summary, events) {
+    const counter = document.getElementById('successful-replies-count');
+    if (!counter) return;
+
+    const fallbackCount = (events || []).filter(event => event.status === 'replied').length;
+    const repliedCount = summary && Number.isInteger(summary.replied)
+        ? summary.replied
+        : fallbackCount;
+    counter.textContent = repliedCount;
+}
+
+function fetchMessageActivity() {
+    fetch('/api/message_activity?limit=10')
+        .then(response => response.json())
+        .then(data => {
+            if (!data.success) {
+                showNotification(data.message || '获取私信处理状态失败', 'error');
+                return;
+            }
+            renderLatestActivity(data.last_event);
+            renderActivityList(data.events || []);
+            updateSuccessfulRepliesCount(data.summary || {}, data.events || []);
+        })
+        .catch(error => {
+            console.error('获取私信处理状态失败:', error);
         });
 }
 
@@ -3463,14 +3842,15 @@ document.addEventListener('DOMContentLoaded', function() {
     // 开始状态轮询
     setInterval(fetchBotStatus, 3000);
     fetchBotStatus();
+    setInterval(fetchMessageActivity, 3000);
+    fetchMessageActivity();
+    setInterval(fetchAccountHealth, 30000);
+    fetchAccountHealth(true);
     
     loadAccounts();
     
     // 初始化运行时间
     updateUptime();
-
-    // 获取公告
-    get_announcement();
     
     const hash = window.location.hash.split("#")[1]
     if (hash) {
@@ -3489,30 +3869,4 @@ document.addEventListener('DOMContentLoaded', function() {
         el.textContent = '{{ session.username }}';
     });
 
-    setTimeout(checkForUpdates, 2000);
-
-    updateSystemStats();
-    setInterval(updateSystemStats, 2000);
-    initImageBed();
-
-    loadInstalledPlugins()
-    getPluginList()
-    initGitHubDiscussions();
-    
-    // 在显示GitHub讨论区时重新加载
-    const githubSection = document.getElementById('github_discussions');
-    if (githubSection) {
-        const observer = new MutationObserver(function(mutations) {
-            mutations.forEach(function(mutation) {
-                if (mutation.type === 'attributes' && mutation.attributeName === 'style') {
-                    if (githubSection.style.display !== 'none') {
-                        initGitHubDiscussions();
-                    }
-                }
-            });
-        });
-        
-        observer.observe(githubSection, { attributes: true });
-    }
-    initNetworkChart();
 });
