@@ -2,7 +2,7 @@
 
 # 🤖 Vbot-B
 
-### B 站私信自动回复机器人 · 已修 2026 风控
+### B 站私信自动回复机器人
 
 [![License](https://img.shields.io/badge/license-MIT-F59E0B.svg)](LICENSE)
 [![Version](https://img.shields.io/badge/version-v1.0.0-0E7490.svg)](#)
