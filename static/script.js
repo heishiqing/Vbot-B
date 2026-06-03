@@ -478,9 +478,13 @@ document.addEventListener('DOMContentLoaded', function() {
 
 // 显示指定部分，隐藏其他部分
 function showSection(sectionId) {
-    // 2026-06-03 owner 修: 'about' 加白名单, 原版只允许 dashboard/accounts/logs
-    // 导致侧栏"❤ 关于·支持作者"按钮点了被强制 fallback 到 dashboard, 死活进不去
-    const allowedSections = new Set(['dashboard', 'accounts', 'logs', 'about']);
+    // 2026-06-03 owner 修: 全量补白名单 — 原版只允许 dashboard/accounts/logs,
+    // 导致 image_bed / plugins / admin / github_discussions / about 5 个真功能 section
+    // 点 nav 都被强制 fallback 到 dashboard, 等于隐藏功能.
+    const allowedSections = new Set([
+        'dashboard', 'accounts', 'logs',
+        'image_bed', 'plugins', 'admin', 'github_discussions', 'about',
+    ]);
     if (!allowedSections.has(sectionId)) {
         sectionId = 'dashboard';
         window.location.hash = '#dashboard';
