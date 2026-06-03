@@ -27,7 +27,7 @@
             </a>
             <a href="#accounts" onclick="showSection('accounts')" class="nav-item flex items-center space-x-3 px-4 py-3 text-gray-600 hover:bg-gray-50 rounded-lg transition">
                 <i class="fa fa-users text-gray-400 w-5"></i>
-                <span>多账号管理</span>
+                <span>系统设置</span>
             </a>
             <a href="#logs" onclick="showSection('logs')" class="nav-item flex items-center space-x-3 px-4 py-3 text-gray-600 hover:bg-gray-50 rounded-lg transition">
                 <i class="fa fa-terminal text-gray-400 w-5"></i>
@@ -44,7 +44,7 @@
             </a>
             <a href="#admin" onclick="showSection('admin')" class="nav-item flex items-center space-x-3 px-4 py-3 text-gray-600 hover:bg-gray-50 rounded-lg transition">
                 <i class="fa fa-cog text-gray-400 w-5"></i>
-                <span>后台设置</span>
+                <span>账户设置</span>
             </a>
             <!-- 关于/支持作者 -->
             <a href="#about" onclick="showSection('about')" class="nav-item flex items-center space-x-3 px-4 py-3 text-gray-600 hover:bg-cyan-50 rounded-lg transition">
@@ -373,7 +373,7 @@
             </div>
         </div>
 
-        <!-- 多账号管理 -->
+        <!-- 系统设置 -->
         <div id="accounts" class="section p-4 lg:p-6" style="display: none;">
             <div class="mb-6">
                 <div class="flex items-center justify-between">
@@ -382,8 +382,8 @@
                             <i class="fa fa-bars"></i>
                         </button>
                         <div>
-                            <h2 class="text-2xl lg:text-3xl font-bold text-gray-800">多账号管理</h2>
-                            <p class="text-gray-600 mt-2">管理多个B站账号的自动回复</p>
+                            <h2 class="text-2xl lg:text-3xl font-bold text-gray-800">系统设置</h2>
+                            <p class="text-gray-600 mt-2">管理 B 站账号 + 全局关键词配置</p>
                         </div>
                     </div>
                     <button onclick="showAddAccountModal()" 
@@ -524,7 +524,7 @@
             </div>
         </div>
 
-        <!-- 后台设置 (面板自身的 admin 账号/密码, 跟 B 站账号区分开) -->
+        <!-- 账户设置 (面板登录账户 admin/密码) -->
         <div id="admin" class="section p-4 lg:p-6" style="display: none;">
             <div class="mb-6">
                 <div class="flex items-center">
@@ -532,7 +532,7 @@
                         <i class="fa fa-bars"></i>
                     </button>
                     <div>
-                        <h2 class="text-2xl lg:text-3xl font-bold text-gray-800">后台设置</h2>
+                        <h2 class="text-2xl lg:text-3xl font-bold text-gray-800">账户设置</h2>
                         <p class="text-gray-600 mt-2">修改面板登录账号与密码</p>
                     </div>
                 </div>

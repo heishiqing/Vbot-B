@@ -1052,7 +1052,7 @@ def get_python3_path():
     
     return None
 
-# 多账号管理路由
+# 系统设置路由 (B 站账号管理 + 全局关键词)
 @app.route('/api/get_accounts')
 @login_required
 def get_accounts():
@@ -2810,7 +2810,7 @@ def create_templates():
             </a>
             <a href="#accounts" onclick="showSection('accounts')" class="nav-item flex items-center space-x-3 px-4 py-3 text-gray-600 hover:bg-gray-50 rounded-lg transition">
                 <i class="fa fa-users text-gray-400 w-5"></i>
-                <span>多账号管理</span>
+                <span>系统设置</span>
             </a>
             <a href="#github_discussions" onclick="showSection('github_discussions')" class="nav-item flex items-center space-x-3 px-4 py-3 text-gray-600 hover:bg-gray-50 rounded-lg transition">
                 <i class="fab fa-github text-gray-400 w-5"></i>
@@ -3308,7 +3308,7 @@ def create_templates():
             </div>
         </div>
 
-        <!-- 多账号管理 -->
+        <!-- 系统设置 -->
         <div id="accounts" class="section p-4 lg:p-6" style="display: none;">
             <div class="mb-6">
                 <div class="flex items-center justify-between">
@@ -3317,8 +3317,8 @@ def create_templates():
                             <i class="fa fa-bars"></i>
                         </button>
                         <div>
-                            <h2 class="text-2xl lg:text-3xl font-bold text-gray-800">多账号管理</h2>
-                            <p class="text-gray-600 mt-2">管理多个B站账号的自动回复</p>
+                            <h2 class="text-2xl lg:text-3xl font-bold text-gray-800">系统设置</h2>
+                            <p class="text-gray-600 mt-2">管理 B 站账号 + 全局关键词配置</p>
                         </div>
                     </div>
                     <button onclick="showAddAccountModal()" 
